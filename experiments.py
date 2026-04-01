@@ -24,6 +24,14 @@ from torch.utils.data import DataLoader, TensorDataset
 import warnings
 warnings.filterwarnings("ignore")
 
+# Helper Function 
+def count_trainable_params(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"    Trainable params: {trainable:,} / {total:,} "
+          f"({100 * trainable / total:.2f}%)")
+    return trainable, total
+
 # ── Try importing TimesFM (Google's model) ──────────────────────────────────
 try:
     import timesfm
@@ -339,6 +347,7 @@ def run_sft(X_train_full, y_train_full, X_test, y_test, train_fracs):
         print(f"  frac={frac:.0%}  n_samples={n}")
 
         model  = TimeSeriesTransformer()          # fresh each run
+        count_trainable_params(model)           # all params are trainable in SFT   
         loader = get_dataloader(X_sub, y_sub)
         model  = train_model(model, loader)
         mse    = evaluate_model(model, X_test, y_test)
