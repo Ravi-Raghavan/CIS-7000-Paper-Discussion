@@ -346,24 +346,24 @@ def plot_results(zero_shot_mse, lora_results_rank_4, lora_results_rank_8, lora_r
 
     # LoRA lines (one per rank)
     lora_series = [
-        (lora_mse_4,  "#4fc3f7", "o", "LoRA r=4",  9),
+        (lora_mse_4,  "#43ff56", "o", "LoRA r=4",  9),
         (lora_mse_8,  "#ab47bc", "^", "LoRA r=8",  9),
         (lora_mse_16, "#26c6da", "D", "LoRA r=16", 9),
     ]
     for mse_vals, color, marker, label, y_offset in lora_series:
         ax.plot(fracs_pct, mse_vals, marker=marker, markersize=7,
                 color=color, linewidth=2.2, label=label, zorder=4)
-        for x, y in zip(fracs_pct, mse_vals):
-            ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points",
-                        xytext=(0, y_offset), ha="center", fontsize=7.5, color=color)
+        # for x, y in zip(fracs_pct, mse_vals):
+        #     ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points",
+        #                 xytext=(0, y_offset), ha="center", fontsize=7.5, color=color)
 
     # SFT line
     ax.plot(fracs_pct, sft_mse, marker="s", markersize=7,
             color="#ef5350", linewidth=2.2,
             label="Standard Fine-Tuning", zorder=4)
-    for x, y in zip(fracs_pct, sft_mse):
-        ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points",
-                    xytext=(0, -16), ha="center", fontsize=7.5, color="#ef5350")
+    # for x, y in zip(fracs_pct, sft_mse):
+    #     ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points",
+    #                 xytext=(0, -16), ha="center", fontsize=7.5, color="#ef5350")
 
     # Axes styling
     ax.set_xlabel("Training Data Used (%)", color="#c9d1d9", fontsize=12, labelpad=10)
