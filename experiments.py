@@ -1,11 +1,8 @@
 """
-TimesFM ETTh1 Benchmark: Zero-Shot vs LoRA vs Standard Fine-Tuning
+ETTh1 Benchmark: Zero-Shot vs LoRA vs Standard Fine-Tuning
 =================================================================
-Evaluates TimesFM across three training regimes on the ETTh1 dataset.
+Evaluates TimesFM-Based Surrogate Model across three training regimes on the ETTh1 dataset.
 Plots % Training Data vs MSE for each method.
-
-Dependencies:
-    pip install timesfm datasets pandas numpy matplotlib scikit-learn torch peft
 """
 
 import os
@@ -31,25 +28,6 @@ def count_trainable_params(model):
     print(f"    Trainable params: {trainable:,} / {total:,} "
           f"({100 * trainable / total:.2f}%)")
     return trainable, total
-
-# ── Try importing TimesFM (Google's model) ──────────────────────────────────
-try:
-    import timesfm
-    TIMESFM_AVAILABLE = True
-except ImportError:
-    TIMESFM_AVAILABLE = False
-    print("[WARNING] timesfm not installed. Run: pip install timesfm")
-    print("[INFO] Falling back to a lightweight Transformer surrogate for demo.\n")
-
-# ── Try importing PEFT for LoRA ──────────────────────────────────────────────
-try:
-    from peft import get_peft_model, LoraConfig, TaskType
-    PEFT_AVAILABLE = True
-except ImportError:
-    PEFT_AVAILABLE = False
-    print("[WARNING] peft not installed. Run: pip install peft")
-    print("[INFO] LoRA will use a manual low-rank adapter instead.\n")
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # 0. CONFIG
@@ -115,44 +93,73 @@ def split_dataset(df, target_col=TARGET_COL):
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 2. SURROGATE MODEL (used when TimesFM is unavailable OR for fine-tuning)
+# 2. SURROGATE MODEL to Replicate TimesFM
 # ════════════════════════════════════════════════════════════════════════════
 class TimeSeriesTransformer(nn.Module):
     """
-    Lightweight Transformer for time-series forecasting.
-    Mimics TimesFM's patch-based encoder architecture at smaller scale.
-    Used as surrogate when timesfm package is absent, and as the
-    fine-tunable backbone in both SFT and LoRA experiments.
+    Decoder-only Transformer (GPT-style) for time-series forecasting.
     """
     def __init__(self, context_len=CONTEXT_LEN, forecast_len=FORECAST_LEN,
                  d_model=128, nhead=4, num_layers=3, patch_size=32):
         super().__init__()
-        self.patch_size  = patch_size
+
+        self.patch_size = patch_size
         self.num_patches = context_len // patch_size
         self.forecast_len = forecast_len
+        self.d_model = d_model
 
+        # ---- Patch embedding ----
         self.patch_embed = nn.Linear(patch_size, d_model)
         self.pos_emb     = nn.Embedding(self.num_patches, d_model)
-        encoder_layer    = nn.TransformerEncoderLayer(
-            d_model=d_model, nhead=nhead, dim_feedforward=d_model * 4,
-            dropout=0.1, batch_first=True
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.head    = nn.Linear(d_model * self.num_patches, forecast_len)
 
-    def forward(self, x):                          # x: (B, context_len)
+        # ---- Decoder-only stack ----
+        decoder_layer = nn.TransformerDecoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=d_model * 4,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_layers)
+
+        # ---- Output head ----
+        self.head = nn.Linear(d_model * self.num_patches, forecast_len)
+
+    def _causal_mask(self, size, device):
+        return torch.triu(
+            torch.full((size, size), float('-inf'), device=device),
+            diagonal=1
+        )
+
+    def forward(self, x):
+        """
+        x: (B, context_len)
+        """
         B = x.size(0)
+        device = x.device
+
+        # ---- Patchify ----
         patches = x.view(B, self.num_patches, self.patch_size)  # (B, P, patch_size)
-        h = self.patch_embed(patches)              # (B, P, d_model)
-        pos = torch.arange(self.num_patches, device=x.device)
+        h = self.patch_embed(patches)                           # (B, P, d_model)
+
+        # ---- Add positional encoding ----
+        pos = torch.arange(self.num_patches, device=device)
         h = h + self.pos_emb(pos)
-        h = self.encoder(h)                        # (B, P, d_model)
-        h = h.reshape(B, -1)                       # (B, P*d_model)
-        return self.head(h)                        # (B, forecast_len)
+
+        # ---- Causal mask ----
+        tgt_mask = self._causal_mask(self.num_patches, device)
+
+        # ---- Decoder (no encoder memory) ----
+        # memory=None → acts like GPT-style self-attention
+        h = self.decoder(tgt=h, memory=h, tgt_mask=tgt_mask)
+
+        # ---- Flatten + predict ----
+        h = h.reshape(B, -1)
+        return self.head(h)
 
 
 # ════════════════════════════════════════════════════════════════════════════
-# 3. MANUAL LoRA (fallback when peft not available)
+# 3. LoRA Implementation
 # ════════════════════════════════════════════════════════════════════════════
 class LoRALinear(nn.Module):
     """Wraps an existing Linear layer with a low-rank adapter (r=8)."""
@@ -193,11 +200,11 @@ class LoRALinear(nn.Module):
 
 
 def inject_lora(model: nn.Module, r: int = 8) -> nn.Module:
-    """Replace every Linear in the encoder with a LoRA-wrapped version."""
-    for name, module in list(model.encoder.named_modules()):
+    """Replace every Linear in the Decoder with a LoRA-wrapped version."""
+    for name, module in list(model.decoder.named_modules()):
         if isinstance(module, nn.Linear):
             parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
-            parent = model.encoder
+            parent = model.decoder
             for part in parent_name.split("."):
                 if part:
                     parent = getattr(parent, part)
@@ -259,32 +266,8 @@ def run_zero_shot(X_test, y_test):
     on the test set — no gradient updates whatsoever.
     """
     print("\n── Zero-Shot Inference ──")
-    if TIMESFM_AVAILABLE:
-        print("  Using official TimesFM checkpoint...")
-        tfm = timesfm.TimesFm(
-            context_len=CONTEXT_LEN,
-            horizon_len=FORECAST_LEN,
-            input_patch_len=32,
-            output_patch_len=128,
-            num_layers=20,
-            model_dims=1280,
-            backend=("gpu" if torch.cuda.is_available() else "cpu"),
-        )
-        tfm.load_from_checkpoint(repo_id="google/timesfm-1.0-200m-pytorch")
-        all_preds, all_true = [], []
-        for i in range(len(X_test)):
-            context = X_test[i : i + 1]       # (1, context_len)
-            freq    = [0]                      # 0 = high-freq (hourly)
-            point_forecast, _ = tfm.forecast(context.tolist(), freq=freq)
-            all_preds.append(point_forecast[0][:FORECAST_LEN])
-            all_true.append(y_test[i])
-        preds = np.array(all_preds)
-        true  = np.array(all_true)
-        mse   = mean_squared_error(true.flatten(), preds.flatten())
-    else:
-        print("  TimesFM not available — using untrained surrogate (random weights).")
-        model = TimeSeriesTransformer().to(DEVICE)
-        mse   = evaluate_model(model, X_test, y_test)
+    model = TimeSeriesTransformer().to(DEVICE)
+    mse   = evaluate_model(model, X_test, y_test)
     print(f"  Zero-Shot MSE: {mse:.4f}")
     return mse
 
@@ -292,9 +275,9 @@ def run_zero_shot(X_test, y_test):
 # ════════════════════════════════════════════════════════════════════════════
 # 6. LORA FINE-TUNING
 # ════════════════════════════════════════════════════════════════════════════
-def run_lora(X_train_full, y_train_full, X_test, y_test, train_fracs):
+def run_lora(X_train_full, y_train_full, X_test, y_test, train_fracs, lora_rank = 8):
     """Fine-tune only LoRA adapters; backbone is frozen."""
-    print("\n── LoRA Fine-Tuning ──")
+    print(f"\n── LoRA Fine-Tuning: Rank = {lora_rank} ──")
     results = {}
     for frac in train_fracs:
         n = max(1, int(len(X_train_full) * frac))
@@ -302,29 +285,12 @@ def run_lora(X_train_full, y_train_full, X_test, y_test, train_fracs):
         print(f"  frac={frac:.0%}  n_samples={n}")
 
         # Fresh backbone each run (simulates loading pretrained checkpoint)
-        base_model = TimeSeriesTransformer()
-
-        if PEFT_AVAILABLE and hasattr(base_model, "encoder"):
-            # PEFT LoRA — works on nn.Linear layers inside encoder
-            try:
-                lora_cfg = LoraConfig(
-                    r=8, lora_alpha=16, lora_dropout=0.05,
-                    target_modules=["self_attn.in_proj_weight"],  # adjust if needed
-                    task_type=TaskType.FEATURE_EXTRACTION,
-                )
-                model = get_peft_model(base_model, lora_cfg)
-                print("    PEFT LoRA injected.")
-            except Exception:
-                model = inject_lora(base_model)
-                print("    Manual LoRA injected (PEFT config not compatible).")
-        else:
-            model = inject_lora(base_model)
-            print("    Manual LoRA injected.")
+        base_model = TimeSeriesTransformer().to(DEVICE)
+        model = inject_lora(base_model, r = lora_rank)
+        print("    Manual LoRA injected.")
 
         # Count trainable params
-        total  = sum(p.numel() for p in model.parameters())
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"    Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.1f}%)")
+        count_trainable_params(model)
 
         loader = get_dataloader(X_sub, y_sub)
         model  = train_model(model, loader)
@@ -346,7 +312,7 @@ def run_sft(X_train_full, y_train_full, X_test, y_test, train_fracs):
         X_sub, y_sub = X_train_full[:n], y_train_full[:n]
         print(f"  frac={frac:.0%}  n_samples={n}")
 
-        model  = TimeSeriesTransformer()          # fresh each run
+        model  = TimeSeriesTransformer().to(DEVICE)          # fresh each run
         count_trainable_params(model)           # all params are trainable in SFT   
         loader = get_dataloader(X_sub, y_sub)
         model  = train_model(model, loader)
@@ -359,13 +325,15 @@ def run_sft(X_train_full, y_train_full, X_test, y_test, train_fracs):
 # ════════════════════════════════════════════════════════════════════════════
 # 8. PLOTTING
 # ════════════════════════════════════════════════════════════════════════════
-def plot_results(zero_shot_mse, lora_results, sft_results, save_path="results.png"):
+def plot_results(zero_shot_mse, lora_results_rank_4, lora_results_rank_8, lora_results_rank_16, sft_results, save_path="results.png"):
     fracs_pct = [f * 100 for f in TRAIN_FRACS]
 
-    lora_mse = [lora_results[f] for f in TRAIN_FRACS]
-    sft_mse  = [sft_results[f]  for f in TRAIN_FRACS]
+    lora_mse_4  = [lora_results_rank_4[f]  for f in TRAIN_FRACS]
+    lora_mse_8  = [lora_results_rank_8[f]  for f in TRAIN_FRACS]
+    lora_mse_16 = [lora_results_rank_16[f] for f in TRAIN_FRACS]
+    sft_mse     = [sft_results[f]          for f in TRAIN_FRACS]
 
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(11, 6))
     fig.patch.set_facecolor("#0d1117")
     ax.set_facecolor("#0d1117")
 
@@ -376,13 +344,18 @@ def plot_results(zero_shot_mse, lora_results, sft_results, save_path="results.pn
     ax.axhline(zero_shot_mse, color="#f0c040", linewidth=1.8,
                linestyle=":", label=f"Zero-Shot (MSE={zero_shot_mse:.3f})", zorder=3)
 
-    # LoRA line
-    ax.plot(fracs_pct, lora_mse, marker="o", markersize=7,
-            color="#4fc3f7", linewidth=2.2,
-            label="LoRA Fine-Tuning", zorder=4)
-    for x, y in zip(fracs_pct, lora_mse):
-        ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points",
-                    xytext=(0, 9), ha="center", fontsize=8, color="#4fc3f7")
+    # LoRA lines (one per rank)
+    lora_series = [
+        (lora_mse_4,  "#4fc3f7", "o", "LoRA r=4",  9),
+        (lora_mse_8,  "#ab47bc", "^", "LoRA r=8",  9),
+        (lora_mse_16, "#26c6da", "D", "LoRA r=16", 9),
+    ]
+    for mse_vals, color, marker, label, y_offset in lora_series:
+        ax.plot(fracs_pct, mse_vals, marker=marker, markersize=7,
+                color=color, linewidth=2.2, label=label, zorder=4)
+        for x, y in zip(fracs_pct, mse_vals):
+            ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points",
+                        xytext=(0, y_offset), ha="center", fontsize=7.5, color=color)
 
     # SFT line
     ax.plot(fracs_pct, sft_mse, marker="s", markersize=7,
@@ -390,16 +363,12 @@ def plot_results(zero_shot_mse, lora_results, sft_results, save_path="results.pn
             label="Standard Fine-Tuning", zorder=4)
     for x, y in zip(fracs_pct, sft_mse):
         ax.annotate(f"{y:.3f}", (x, y), textcoords="offset points",
-                    xytext=(0, -16), ha="center", fontsize=8, color="#ef5350")
-
-    # Shaded region between LoRA and SFT
-    ax.fill_between(fracs_pct, lora_mse, sft_mse,
-                    alpha=0.08, color="#90caf9", zorder=2)
+                    xytext=(0, -16), ha="center", fontsize=7.5, color="#ef5350")
 
     # Axes styling
     ax.set_xlabel("Training Data Used (%)", color="#c9d1d9", fontsize=12, labelpad=10)
     ax.set_ylabel("MSE (normalised)", color="#c9d1d9", fontsize=12, labelpad=10)
-    ax.set_title("TimesFM on ETTh1 — Zero-Shot vs LoRA vs Standard Fine-Tuning",
+    ax.set_title("TimesFM on ETTh1 — Zero-Shot vs LoRA (r=4/8/16) vs Standard Fine-Tuning",
                  color="#ffffff", fontsize=14, fontweight="bold", pad=16)
 
     ax.tick_params(colors="#8b949e", labelsize=9)
@@ -408,8 +377,8 @@ def plot_results(zero_shot_mse, lora_results, sft_results, save_path="results.pn
 
     ax.xaxis.set_major_formatter(mticker.PercentFormatter())
 
-    legend = ax.legend(facecolor="#161b22", edgecolor="#30363d",
-                       labelcolor="#c9d1d9", fontsize=10, loc="upper right")
+    ax.legend(facecolor="#161b22", edgecolor="#30363d",
+              labelcolor="#c9d1d9", fontsize=10, loc="upper right")
 
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
@@ -433,7 +402,9 @@ def main():
 
     # ── Experiments ─────────────────────────────────────────────────────────
     zero_shot_mse = run_zero_shot(X_test, y_test)
-    lora_results  = run_lora(X_train, y_train, X_test, y_test, TRAIN_FRACS)
+    lora_results_rank_4 = run_lora(X_train, y_train, X_test, y_test, TRAIN_FRACS, lora_rank = 4)
+    lora_results_rank_8  = run_lora(X_train, y_train, X_test, y_test, TRAIN_FRACS, lora_rank = 8)
+    lora_results_rank_16 = run_lora(X_train, y_train, X_test, y_test, TRAIN_FRACS, lora_rank = 16)
     sft_results   = run_sft(X_train, y_train, X_test, y_test, TRAIN_FRACS)
 
     # ── Results Table ────────────────────────────────────────────────────────
@@ -443,12 +414,28 @@ def main():
     print(f"{'Train %':>10} {'LoRA MSE':>12} {'SFT MSE':>12}")
     print("-" * 36)
     for f in TRAIN_FRACS:
-        print(f"{f*100:>9.0f}% {lora_results[f]:>12.4f} {sft_results[f]:>12.4f}")
+        print(f"{f*100:>9.0f}% {lora_results_rank_4[f]:>12.4f} {lora_results_rank_8[f]:>12.4f} {lora_results_rank_16[f]:>12.4f} {sft_results[f]:>12.4f}")
     print(f"\n{'Zero-Shot MSE':>23} {zero_shot_mse:>12.4f}")
     print("=" * 60)
 
+    # ── Save Results to CSV ──────────────────────────────────────────────────
+    rows = []
+    for f in TRAIN_FRACS:
+        rows.append({
+            "train_pct":      f * 100,
+            "lora_r4_mse":    lora_results_rank_4[f],
+            "lora_r8_mse":    lora_results_rank_8[f],
+            "lora_r16_mse":   lora_results_rank_16[f],
+            "sft_mse":        sft_results[f],
+            "zero_shot_mse":  zero_shot_mse,
+        })
+    results_df = pd.DataFrame(rows)
+    csv_path = "timesfm_etth1_results.csv"
+    results_df.to_csv(csv_path, index=False)
+    print(f"✓ Results saved to: {csv_path}")
+
     # ── Plot ─────────────────────────────────────────────────────────────────
-    plot_results(zero_shot_mse, lora_results, sft_results,
+    plot_results(zero_shot_mse, lora_results_rank_4, lora_results_rank_8, lora_results_rank_16, sft_results,
                  save_path="timesfm_etth1_results.png")
 
 
